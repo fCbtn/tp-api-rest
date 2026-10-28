@@ -2,19 +2,41 @@
 
 import os
 import secrets
+from collections import Counter
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
-from app import docker_client
+from app import docker_client, netbox_client
 
 app = FastAPI(title="API d'administration de conteneurs")
+
+# Compteur de remédiations déclenchées par le webhook (un seul worker uvicorn).
+remediations = 0
 
 
 class ConteneurACreer(BaseModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9-]{1,30}$")
     image: Literal["nginx:alpine", "redis:alpine", "httpd:alpine"]
+
+
+class Alerte(BaseModel):
+    alert: Literal["container_down"]
+    container: str = Field(pattern=r"^[a-z][a-z0-9-]{1,30}$")
+
+
+# Descriptions des codes d'erreur, pour la documentation OpenAPI.
+ERREURS = {
+    401: {"description": "Token absent ou inconnu"},
+    403: {"description": "Rôle insuffisant"},
+    404: {"description": "Conteneur inconnu ou non géré par l'API"},
+    409: {"description": "Conflit avec l'état actuel"},
+}
+
+
+def _docs(*codes):
+    return {code: ERREURS[code] for code in codes}
 
 
 # --- authentification -----------------------------------------------------
@@ -49,6 +71,13 @@ def exiger_admin(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=403, detail="Rôle insuffisant")
 
 
+def verifier_secret(x_webhook_secret: str | None = Header(default=None)):
+    """Vérifie le secret partagé du webhook ; 401 s'il est absent ou faux."""
+    attendu = os.environ.get("WEBHOOK_SECRET", "")
+    if not attendu or not x_webhook_secret or not secrets.compare_digest(x_webhook_secret, attendu):
+        raise HTTPException(status_code=401, detail="Secret de webhook absent ou faux")
+
+
 # --- utilitaires ----------------------------------------------------------
 
 
@@ -60,51 +89,138 @@ def _gere_ou_404(identifiant):
     return conteneur
 
 
-# --- routes ---------------------------------------------------------------
+# --- lecture --------------------------------------------------------------
 
 
-@app.get("/health")
+@app.get("/health", summary="Vérifie que l'API répond")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/containers", dependencies=[Depends(exiger_lecture)])
+@app.get(
+    "/containers",
+    summary="Liste les conteneurs gérés",
+    dependencies=[Depends(exiger_lecture)],
+    responses=_docs(401),
+)
 def lister_containers():
     return docker_client.lister()
 
 
-@app.get("/containers/{identifiant}", dependencies=[Depends(exiger_lecture)])
+@app.get(
+    "/containers/{identifiant}",
+    summary="Détail d'un conteneur géré",
+    dependencies=[Depends(exiger_lecture)],
+    responses=_docs(401, 404),
+)
 def lire_container(identifiant: str):
     return _gere_ou_404(identifiant)
 
 
-@app.post("/containers", status_code=201, dependencies=[Depends(exiger_admin)])
+# --- écriture -------------------------------------------------------------
+
+
+@app.post(
+    "/containers",
+    status_code=201,
+    summary="Crée et démarre un conteneur",
+    dependencies=[Depends(exiger_admin)],
+    responses=_docs(401, 403, 409),
+)
 def creer_container(corps: ConteneurACreer):
     try:
-        return docker_client.creer(corps.name, corps.image)
+        conteneur = docker_client.creer(corps.name, corps.image)
     except docker_client.Conflit as erreur:
         raise HTTPException(status_code=409, detail=str(erreur))
+    netbox_client.creer_vm(conteneur["name"])
+    return conteneur
 
 
-@app.post("/containers/{identifiant}/stop", dependencies=[Depends(exiger_admin)])
+@app.post(
+    "/containers/{identifiant}/stop",
+    summary="Arrête un conteneur",
+    dependencies=[Depends(exiger_admin)],
+    responses=_docs(401, 403, 404, 409),
+)
 def arreter_container(identifiant: str):
     conteneur = _gere_ou_404(identifiant)
     try:
-        return docker_client.arreter(conteneur["id"])
+        resultat = docker_client.arreter(conteneur["id"])
     except docker_client.Conflit as erreur:
         raise HTTPException(status_code=409, detail=str(erreur))
+    netbox_client.maj_statut(resultat["name"], "offline")
+    return resultat
 
 
-@app.post("/containers/{identifiant}/start", dependencies=[Depends(exiger_admin)])
+@app.post(
+    "/containers/{identifiant}/start",
+    summary="Démarre un conteneur arrêté",
+    dependencies=[Depends(exiger_admin)],
+    responses=_docs(401, 403, 404, 409),
+)
 def demarrer_container(identifiant: str):
     conteneur = _gere_ou_404(identifiant)
     try:
-        return docker_client.demarrer(conteneur["id"])
+        resultat = docker_client.demarrer(conteneur["id"])
     except docker_client.Conflit as erreur:
         raise HTTPException(status_code=409, detail=str(erreur))
+    netbox_client.maj_statut(resultat["name"], "active")
+    return resultat
 
 
-@app.delete("/containers/{identifiant}", status_code=204, dependencies=[Depends(exiger_admin)])
+@app.delete(
+    "/containers/{identifiant}",
+    status_code=204,
+    summary="Supprime un conteneur",
+    dependencies=[Depends(exiger_admin)],
+    responses=_docs(401, 403, 404),
+)
 def supprimer_container(identifiant: str):
     conteneur = _gere_ou_404(identifiant)
     docker_client.supprimer(conteneur["id"])
+    netbox_client.supprimer_vm(conteneur["name"])
+
+
+# --- webhook --------------------------------------------------------------
+
+
+@app.post(
+    "/webhooks/alerts",
+    status_code=202,
+    summary="Reçoit une alerte et redémarre le conteneur visé",
+    dependencies=[Depends(verifier_secret)],
+    responses=_docs(401, 404),
+)
+def recevoir_alerte(alerte: Alerte):
+    global remediations
+    conteneur = docker_client.lire_par_nom(alerte.container)
+    if conteneur is None:
+        raise HTTPException(status_code=404, detail="Conteneur inconnu ou non géré")
+    if conteneur["state"] != "running":
+        docker_client.demarrer(conteneur["id"])
+        netbox_client.maj_statut(conteneur["name"], "active")
+        remediations += 1
+    return {"status": "accepted"}
+
+
+# --- métriques ------------------------------------------------------------
+
+
+@app.get("/metrics", summary="Métriques au format Prometheus")
+def metriques():
+    etats = Counter(c["state"] for c in docker_client.lister())
+    for etat in ("running", "exited"):
+        etats.setdefault(etat, 0)
+
+    lignes = [
+        "# HELP adminapi_containers Nombre de conteneurs gérés, par état.",
+        "# TYPE adminapi_containers gauge",
+    ]
+    for etat in sorted(etats):
+        lignes.append(f'adminapi_containers{{state="{etat}"}} {etats[etat]}')
+    lignes += [
+        "# HELP adminapi_remediations_total Redémarrages déclenchés par une alerte.",
+        "# TYPE adminapi_remediations_total counter",
+        f"adminapi_remediations_total {remediations}",
+    ]
+    return Response(content="\n".join(lignes) + "\n", media_type="text/plain")

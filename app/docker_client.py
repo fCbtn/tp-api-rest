@@ -53,6 +53,15 @@ def lire(identifiant):
     return _format(bruts[0]) if bruts else None
 
 
+def lire_par_nom(nom):
+    """Un conteneur géré par son nom exact, ou None. (Le filtre « name » de Docker
+    cherche une sous-chaîne : on vérifie donc l'égalité stricte du nom.)"""
+    for conteneur in _lister_bruts({"label": [LABEL], "name": [nom]}):
+        if conteneur["Names"][0].lstrip("/") == nom:
+            return _format(conteneur)
+    return None
+
+
 def _tirer_image(image):
     """Télécharge une image absente de la machine."""
     reponse = session.post(
