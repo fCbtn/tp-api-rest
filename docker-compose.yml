@@ -83,19 +83,18 @@ services:
     image: valkey/valkey:8-alpine
     restart: unless-stopped
 
-  # Votre micro-API : décommentez ce service au TP3, une fois votre Dockerfile écrit.
-  # Dans le réseau de compose, les services se joignent par leur nom, pas par localhost.
-  #
-  # api:
-  #   build: .
-  #   env_file: .env
-  #   environment:
-  #     DOCKER_API_URL: http://docker-api:2375
-  #     NETBOX_URL: http://netbox:8080
-  #   ports:
-  #     - "127.0.0.1:8000:8000"
-  #   depends_on:
-  #     - docker-api
+  # Notre micro-API. Dans le réseau de compose, les services se joignent par
+  # leur nom, pas par localhost : d'où http://docker-api:2375 ci-dessous.
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DOCKER_API_URL: http://docker-api:2375
+      NETBOX_URL: http://netbox:8080
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - docker-api
 
 volumes:
   netbox-donnees:
